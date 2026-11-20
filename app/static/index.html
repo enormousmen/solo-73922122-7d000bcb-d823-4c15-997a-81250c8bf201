@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>虚拟机备份维护台</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 960px; margin: 0 auto; padding: 16px 24px 48px; line-height: 1.55; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-bottom: 8px; }
+  section { border: 1px solid #8884; border-radius: 10px; padding: 14px 18px; margin: 14px 0; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: .92rem; }
+  .bar b { font-weight: 600; }
+  textarea { width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: .82rem;
+             border-radius: 6px; border: 1px solid #8886; padding: 8px; background: transparent; color: inherit; }
+  button { cursor: pointer; border: 1px solid #8888; border-radius: 6px; padding: 5px 12px;
+           background: #2f6fdd; color: #fff; font-size: .9rem; }
+  button.ghost { background: transparent; color: inherit; }
+  button:disabled { opacity: .38; cursor: not-allowed; }
+  ul.tree, ul.tree ul { list-style: none; padding-left: 22px; }
+  ul.tree { padding-left: 4px; }
+  ul.tree li { margin: 5px 0; padding: 6px 10px; border-left: 3px solid #2f6fdd55; background: #8881; border-radius: 6px; }
+  .meta { color: #888; font-size: .82rem; margin: 0 8px; }
+  .tag { font-size: .75rem; border: 1px solid #8888; border-radius: 10px; padding: 1px 8px; margin-left: 6px; }
+  #log { background: #8881; border-radius: 6px; padding: 10px; min-height: 3em;
+         white-space: pre-wrap; font-size: .85rem; max-height: 220px; overflow: auto; }
+  .ok { color: #2e9e4f; } .err { color: #d64545; }
+  #recovery { border-color: #d6a445; } #recovery li { color: #b9832a; }
+  .hint { color: #888; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>🗄️ 虚拟机备份维护台</h1>
+
+<section>
+  <div class="bar" id="status">加载中…</div>
+</section>
+
+<section id="recovery" hidden>
+  <h2>⚠️ 启动恢复事件</h2>
+  <ul id="recoveryList"></ul>
+</section>
+
+<section>
+  <h2>1. 导入备份清单（JSON）</h2>
+  <p class="hint">清单包含基盘与可分叉的增量快照；盘块 4 KiB、Base64 编码；单盘 ≤ 16 MiB；每层在卷上各存一个文件。导入会整体替换现有数据。</p>
+  <p>
+    <input type="file" id="file" accept=".json,application/json">
+    <button class="ghost" id="loadSample">载入示例清单</button>
+    <button id="doImport">导入</button>
+  </p>
+  <textarea id="manifestText" rows="9" placeholder='{"disk_size": 1048576, "layers": [{"id":"base","parent":null,"blocks":{"0":"..."}}, ...]}'></textarea>
+</section>
+
+<section>
+  <h2>2. 快照链</h2>
+  <p class="hint">“撤除”会删除该快照并把其块合并进直接子层（缺块才继承，全零块算改写），其余层不动；任一快照都可下载还原后的原始镜像。</p>
+  <div id="tree">尚未导入清单。</div>
+</section>
+
+<section>
+  <h2>消息</h2>
+  <div id="log"></div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function log(msg, isErr = false) {
+  const t = new Date().toLocaleTimeString();
+  const line = document.createElement("div");
+  line.className = isErr ? "err" : "ok";
+  line.textContent = `[${t}] ${msg}`;
+  $("log").prepend(line);
+}
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, opts);
+  const ct = resp.headers.get("content-type") || "";
+  const body = ct.includes("json") ? await resp.json() : await resp.text();
+  if (!resp.ok) {
+    const detail = (body && body.detail) ? body.detail : String(body);
+    throw new Error(`${resp.status}: ${detail}`);
+  }
+  return body;
+}
+
+function fmtSize(n) {
+  if (n == null) return "-";
+  if (n >= 1048576) return (n / 1048576).toFixed(n % 1048576 ? 2 : 0) + " MiB";
+  return (n / 1024).toFixed(0) + " KiB";
+}
+
+async function refresh() {
+  const st = await api("/api/state");
+  const epoch = st.epoch ? st.epoch.slice(0, 8) : "-";
+  $("status").innerHTML = st.initialized
+    ? `<span>状态：<b class="ok">已导入</b></span>
+       <span>盘大小：<b>${fmtSize(st.disk_size)}</b></span>
+       <span>层数：<b>${st.layers.length}</b></span>
+       <span>块大小：<b>${st.block_size} B</b></span>
+       <span>清单 epoch：<b>${epoch}</b></span>`
+    : `<span>状态：<b>未导入</b>（单盘上限 ${fmtSize(st.max_disk_size)}，块 ${st.block_size} B）</span>`;
+
+  const rec = $("recovery");
+  if (st.recovery_events && st.recovery_events.length) {
+    rec.hidden = false;
+    $("recoveryList").innerHTML = st.recovery_events.map(e => `<li>${e}</li>`).join("");
+  } else rec.hidden = true;
+
+  renderTree(st);
+  return st;
+}
+
+function renderTree(st) {
+  const host = $("tree");
+  if (!st.initialized) { host.textContent = "尚未导入清单。"; return; }
+  const byId = Object.fromEntries(st.layers.map(l => [l.id, l]));
+  const roots = st.layers.filter(l => l.parent === null);
+
+  function nodeHtml(l) {
+    const kids = l.children.map(cid => nodeHtml(byId[cid])).join("");
+    const removeBtn = l.can_remove
+      ? `<button data-remove="${l.id}">撤除</button>`
+      : `<button disabled title="${l.parent === null ? "基盘（根层）不能撤除" : "没有子层，不可撤除"}">撤除</button>`;
+    return `<li><b>${l.id}</b><span class="meta">${l.block_count} 块</span>
+      <button class="ghost" data-download="${l.id}">下载镜像</button>
+      ${removeBtn}
+      ${l.parent === null ? '<span class="tag">基盘</span>' : ""}
+      ${kids ? `<ul>${kids}</ul>` : ""}</li>`;
+  }
+  host.innerHTML = `<ul class="tree">${roots.map(nodeHtml).join("")}</ul>`;
+
+  host.querySelectorAll("[data-download]").forEach(btn =>
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-download");
+      log(`开始下载 ${id}.raw …`);
+      window.location = `/api/download/${encodeURIComponent(id)}`;
+    }));
+  host.querySelectorAll("[data-remove]").forEach(btn =>
+    btn.addEventListener("click", async () => {
+      const id = btn.getAttribute("data-remove");
+      if (!confirm(`确认撤除快照「${id}」？\n其直接子层将被重写，恢复点字节保持不变。`)) return;
+      try {
+        const st2 = await api(`/api/remove/${encodeURIComponent(id)}`, { method: "POST" });
+        log(st2.message || `已撤除 ${id}`);
+        await refresh();
+      } catch (e) { log(`撤除失败：${e.message}`, true); }
+    }));
+}
+
+$("loadSample").addEventListener("click", async () => {
+  try {
+    const sample = await api("/api/sample");
+    $("manifestText").value = JSON.stringify(sample, null, 1);
+    log("已载入示例清单，点击“导入”生效。");
+  } catch (e) { log(`获取示例失败：${e.message}`, true); }
+});
+
+$("file").addEventListener("change", () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { $("manifestText").value = rd.result; log(`已读取文件 ${f.name}`); };
+  rd.readAsText(f);
+});
+
+$("doImport").addEventListener("click", async () => {
+  let payload;
+  try { payload = JSON.parse($("manifestText").value); }
+  catch (e) { log(`JSON 解析失败：${e.message}`, true); return; }
+  try {
+    const st = await api("/api/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    log(st.message || "导入成功");
+    await refresh();
+  } catch (e) { log(`导入失败：${e.message}`, true); }
+});
+
+refresh().catch(e => log(`加载状态失败：${e.message}`, true));
+</script>
+</body>
+</html>

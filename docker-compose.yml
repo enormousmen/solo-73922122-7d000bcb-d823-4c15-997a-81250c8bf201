@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    image: vm-backup-maint
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+    volumes:
+      - backup-data:/data
+    restart: unless-stopped
+
+volumes:
+  backup-data:
