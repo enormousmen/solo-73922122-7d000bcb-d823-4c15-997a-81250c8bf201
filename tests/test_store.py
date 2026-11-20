@@ -10,6 +10,7 @@ import app.store as store_mod
 from app.store import (
     BLOCK_SIZE,
     JOURNAL_NAME,
+    LAYERS_DIR,
     MAX_DISK_SIZE,
     Store,
     StoreError,
@@ -189,6 +190,167 @@ class TestCrashRecovery:
         (imported.layers_dir / "junk.tmp-123").write_text("x")
         rebooted = Store(tmp_path)
         assert "stray.layer" not in files_on_disk(rebooted)
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+
+# --------------------------------------------------------------------- #
+# 撤除 journal 残留与再次导入的交互（回归：此前重启会 CorruptStoreError）
+# --------------------------------------------------------------------- #
+class TestJournalReimportInteraction:
+    def _other_manifest(self):
+        return make_manifest(
+            disk_size=BLOCK_SIZE * 4,
+            layers=[
+                {"id": "only", "parent": None,
+                 "blocks": {"0": blk(0x55), "1": blk(0x66)}},
+            ],
+        )
+
+    def test_stale_journal_then_reimport_boots_and_bytes_match(self, imported, tmp_path):
+        # 撤除提交后收尾中断：journal 与旧层文件残留
+        plan = imported._prepare_remove("mid")
+        imported._commit_remove(plan)
+        assert (tmp_path / JOURNAL_NAME).exists()
+        image_before_reboot = imported.resolve_image("left")
+
+        # 网页再次导入另一份备份：成功且 journal 必须被清掉
+        st = imported.import_manifest(self._other_manifest())
+        assert [l["id"] for l in st["layers"]] == ["only"]
+        assert not (tmp_path / JOURNAL_NAME).exists()
+        raw_before = imported.resolve_image("only")
+
+        # 重启后显示的是新导入的快照，且镜像与重启前逐字节一致
+        rebooted = Store(tmp_path)
+        assert rebooted.state()["initialized"] is True
+        assert [l["id"] for l in rebooted.state()["layers"]] == ["only"]
+        assert rebooted.resolve_image("only") == raw_before
+        assert raw_before[:BLOCK_SIZE] == bytes([0x55]) * BLOCK_SIZE
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+        # 撤除链的旧文件已成为孤儿，被一并回收
+        assert image_before_reboot  # 撤除链在导入前一直可用
+
+    def test_pre_commit_journal_then_reimport_rolls_back_first(self, imported, tmp_path):
+        before = {lid: imported.resolve_image(lid) for lid in
+                  ["base", "mid", "left", "right", "leaf"]}
+        imported._prepare_remove("mid")           # 提交点前“崩溃”，journal 在途
+
+        imported.import_manifest(self._other_manifest())
+        assert not (tmp_path / JOURNAL_NAME).exists()
+
+        rebooted = Store(tmp_path)
+        assert [l["id"] for l in rebooted.state()["layers"]] == ["only"]
+        assert rebooted.resolve_image("only") == imported.resolve_image("only")
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+        # 回滚发生过：恢复事件记录在执行对账的实例上
+        assert any("回滚" in e for e in imported.recovery_events)
+        assert before  # 旧链在导入成功前始终可解析
+
+    def test_failed_import_keeps_previous_chain_with_journal_present(
+            self, imported, tmp_path):
+        # 已提交未收尾的撤除（journal 残留）+ 一次失败的导入
+        plan = imported._prepare_remove("mid")
+        imported._commit_remove(plan)
+        good = {lid: imported.resolve_image(lid)
+                for lid in ["base", "left", "right", "leaf"]}
+
+        with pytest.raises(StoreError):
+            imported.import_manifest({"disk_size": 65536, "layers": [
+                {"id": "x", "parent": None, "blocks": {"0": "bad!!"}}]})
+
+        # 导入在校验阶段即被拒：磁盘无任何副作用，journal 与待删旧文件原样保留，
+        # 撤除后的链（上一次可用备份）仍可解析
+        assert (tmp_path / JOURNAL_NAME).exists()
+        assert set(plan["obsolete_files"]).issubset(files_on_disk(imported))
+        for lid, img in good.items():
+            assert imported.resolve_image(lid) == img
+
+        # 重启后按 journal 前滚收尾，链依旧可用，字节不变
+        rebooted = Store(tmp_path)
+        assert not (tmp_path / JOURNAL_NAME).exists()
+        for lid, img in good.items():
+            assert rebooted.resolve_image(lid) == img
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+    def test_already_broken_volume_recovers_on_boot(self, imported, tmp_path):
+        # 手工制造旧版本遗留的“死局”：journal 与 manifest epoch 完全不匹配
+        plan = imported._prepare_remove("mid")
+        imported._commit_remove(plan)
+        imported.import_manifest(self._other_manifest())
+        (tmp_path / JOURNAL_NAME).write_text(json.dumps({
+            "op": "remove", "target": "ghost",
+            "old_epoch": "deadbeef00000000", "new_epoch": "deadbeef11111111",
+            "new_files": ["nope.layer"], "obsolete_files": [],
+            "new_manifest": {"epoch": "deadbeef11111111", "layers": {}},
+        }))
+        raw_before = imported.resolve_image("only")
+
+        rebooted = Store(tmp_path)   # 旧实现这里会抛 CorruptStoreError，无法启动
+        assert rebooted.state()["initialized"] is True
+        assert rebooted.resolve_image("only") == raw_before
+        assert not (tmp_path / JOURNAL_NAME).exists()
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+    def test_remove_after_stale_journal_reconciles_then_succeeds(
+            self, imported, tmp_path):
+        # 已提交未收尾的撤除（mid 已不在链上），再发起一次撤除
+        plan = imported._prepare_remove("mid")
+        imported._commit_remove(plan)
+        leaf_before = imported.resolve_image("leaf")
+
+        st = imported.remove("left")   # left 现在直接挂在 base 下且有子层 leaf
+        assert not (tmp_path / JOURNAL_NAME).exists()
+        assert {l["id"] for l in st["layers"]} == {"base", "right", "leaf"}
+        assert imported.resolve_image("leaf") == leaf_before
+
+        rebooted = Store(tmp_path)
+        assert rebooted.resolve_image("leaf") == leaf_before
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+    def test_interrupted_finalize_completes_on_next_boot(self, imported, tmp_path):
+        # 收尾阶段中断（journal 还在、旧文件未删）：重启必须前滚完成
+        expected = {lid: imported.resolve_image(lid)
+                    for lid in ["base", "left", "right", "leaf"]}
+        plan = imported._prepare_remove("mid")
+        imported._commit_remove(plan)
+        obsolete = list(plan["obsolete_files"])
+        assert all((tmp_path / LAYERS_DIR / n).exists() for n in obsolete)
+
+        rebooted = Store(tmp_path)
+        assert any("前滚" in e for e in rebooted.recovery_events)
+        for n in obsolete:
+            assert not (tmp_path / LAYERS_DIR / n).exists()
+        for lid, img in expected.items():
+            assert rebooted.resolve_image(lid) == img
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+    def test_interrupted_rollback_then_boot_keeps_old_chain(
+            self, imported, tmp_path):
+        # 回滚中途中断：journal 与部分新文件残留，重启仍按旧 epoch 回滚
+        before = {lid: imported.resolve_image(lid) for lid in
+                  ["base", "mid", "left", "right", "leaf"]}
+        plan = imported._prepare_remove("mid")
+        # 模拟回滚只删掉了第一个新文件就中断
+        first = plan["new_files"][0]
+        imported._delete_layer_file(first)
+        assert (tmp_path / JOURNAL_NAME).exists()
+
+        rebooted = Store(tmp_path)
+        assert any("回滚" in e for e in rebooted.recovery_events)
+        assert not (tmp_path / JOURNAL_NAME).exists()
+        for lid, img in before.items():
+            assert rebooted.resolve_image(lid) == img
+        assert files_on_disk(rebooted) == manifest_files(rebooted)
+
+    def test_reimport_twice_after_crash_is_stable(self, imported, tmp_path):
+        imported._prepare_remove("mid")     # 提交点前崩溃
+        imported.import_manifest(self._other_manifest())
+        raw1 = imported.resolve_image("only")
+        # 再来一次导入并重启，镜像逐字节一致
+        imported.import_manifest(self._other_manifest())
+        raw2 = imported.resolve_image("only")
+        assert raw1 == raw2
+        rebooted = Store(tmp_path)
+        assert rebooted.resolve_image("only") == raw2
         assert files_on_disk(rebooted) == manifest_files(rebooted)
 
 

@@ -14,7 +14,12 @@
 启动恢复（保证重启后只呈现一套完整可恢复的链）：
     journal 有效且 manifest 已是新 epoch -> 前滚：补删旧文件
     journal 有效且 manifest 仍是旧 epoch -> 回滚：删除新文件，旧链原样保留
+    journal 有效但 epoch 与清单都不匹配 -> 清单权威（典型场景：撤除后又导入了
+        新备份），按清单对账后丢弃日志，被新清单取代的文件由孤儿清理解掉
     journal 缺失或损坏                   -> 切换未开始，清理孤儿/临时文件即可
+
+导入与撤除在动手前都会先对残留 journal 做一次同样的对账，因此“撤除日志未清理 +
+再次导入”不会留下任何在途状态；导入本身失败时旧清单与旧层文件原封不动。
 """
 
 from __future__ import annotations
@@ -92,51 +97,76 @@ class Store:
     # ------------------------------------------------------------------ #
     def _recover(self) -> None:
         journal_path = self.root / JOURNAL_NAME
-        journal = None
         if journal_path.exists():
             try:
                 journal = json.loads(journal_path.read_text("utf-8"))
-                if not isinstance(journal, dict) or journal.get("op") != "remove":
+                if not self._is_valid_journal(journal):
                     raise ValueError("journal 结构不完整")
             except Exception:
                 # 日志写在清单切换之前；日志损坏说明崩溃发生在切换开始之前，
                 # 旧清单必然完好，按“无操作在途”处理并清掉残迹。
-                journal = None
                 journal_path.unlink(missing_ok=True)
                 self.recovery_events.append(
                     "发现损坏的 journal（崩溃发生在切换前），已按无在途操作清理"
                 )
-
-        if journal is not None:
-            manifest = self._load_manifest()
-            epoch = manifest.get("epoch") if manifest else None
-            if epoch == journal.get("new_epoch"):
-                # 清单已切换但收尾未完成 -> 前滚
-                for name in journal.get("obsolete_files", []):
-                    self._delete_layer_file(name)
-                journal_path.unlink(missing_ok=True)
-                self.recovery_events.append(
-                    f"检测到已切换未收尾的撤除（目标 {journal.get('target')}），"
-                    "已前滚并清理旧层文件"
-                )
-            elif epoch == journal.get("old_epoch"):
-                # 清单尚未切换 -> 回滚，旧链原样保留
-                for name in journal.get("new_files", []):
-                    self._delete_layer_file(name)
-                journal_path.unlink(missing_ok=True)
-                self.recovery_events.append(
-                    f"检测到未完成的撤除（目标 {journal.get('target')}），"
-                    "已回滚，保留旧链"
-                )
             else:
-                raise CorruptStoreError(
-                    "journal 与 manifest 的 epoch 均不匹配，存储状态需要人工检查"
-                )
+                self._reconcile_journal(journal)
 
         # 清理根目录残留临时文件与 layers/ 下未被引用的文件（含导入中断的残骸）
         for tmp in self.root.glob("*.tmp-*"):
             tmp.unlink(missing_ok=True)
         self._gc_orphans()
+
+    @staticmethod
+    def _is_valid_journal(journal: object) -> bool:
+        if not isinstance(journal, dict) or journal.get("op") != "remove":
+            return False
+        for key in ("old_epoch", "new_epoch", "new_files", "obsolete_files",
+                    "new_manifest", "target"):
+            if key not in journal:
+                return False
+        return (isinstance(journal["new_files"], list)
+                and isinstance(journal["obsolete_files"], list)
+                and all(isinstance(n, str) for n in journal["new_files"])
+                and all(isinstance(n, str) for n in journal["obsolete_files"])
+                and isinstance(journal["new_manifest"], dict))
+
+    def _reconcile_journal(self, journal: dict) -> None:
+        """按 manifest 与 journal 的实际提交状态对账，并清除 journal。
+
+        启动恢复与导入/撤除前的预处理共用本方法，保证任何时刻都不会带着
+        上一轮操作的在途日志进入新的清单切换。
+        """
+        journal_path = self.root / JOURNAL_NAME
+        manifest = self._load_manifest()
+        epoch = manifest.get("epoch") if manifest else None
+        if epoch == journal.get("new_epoch"):
+            # 清单已切换但收尾未完成 -> 前滚：补删旧文件
+            for name in journal.get("obsolete_files", []):
+                self._delete_layer_file(name)
+            journal_path.unlink(missing_ok=True)
+            self.recovery_events.append(
+                f"检测到已切换未收尾的撤除（目标 {journal.get('target')}），"
+                "已前滚并清理旧层文件"
+            )
+        elif epoch == journal.get("old_epoch"):
+            # 清单尚未切换 -> 回滚，旧链原样保留
+            for name in journal.get("new_files", []):
+                self._delete_layer_file(name)
+            journal_path.unlink(missing_ok=True)
+            self.recovery_events.append(
+                f"检测到未完成的撤除（目标 {journal.get('target')}），"
+                "已回滚，保留旧链"
+            )
+        else:
+            # epoch 与日志的新旧值都不匹配：清单已被后续操作（如再次导入）替换。
+            # 清单是唯一的提交权威，journal 描述的在途状态已无意义，直接丢弃；
+            # 日志里的新/旧文件若不被当前清单引用，由随后的孤儿清理解掉。
+            journal_path.unlink(missing_ok=True)
+            self.recovery_events.append(
+                f"发现与当前清单 epoch 不匹配的陈旧 journal（撤除目标 "
+                f"{journal.get('target')}），清单已被后续操作替换，已丢弃日志并对账"
+            )
 
     def _gc_orphans(self) -> None:
         referenced = set()
@@ -150,6 +180,27 @@ class Store:
                 removed += 1
         if removed:
             self.recovery_events.append(f"清理了 {removed} 个未被引用的层文件")
+
+    def _reconcile_pending_journal(self) -> None:
+        """操作入口处的在途日志对账：损坏即清除，有效则按提交状态收尾/回滚。
+
+        调用方必须持有 self._lock。对账后 journal 必然不存在，且磁盘文件与
+        当前 manifest 重新一致（孤儿由 _gc_orphans 兜底）。
+        """
+        journal_path = self.root / JOURNAL_NAME
+        if not journal_path.exists():
+            return
+        try:
+            journal = json.loads(journal_path.read_text("utf-8"))
+            if not self._is_valid_journal(journal):
+                raise ValueError("journal 结构不完整")
+        except Exception:
+            journal_path.unlink(missing_ok=True)
+            self.recovery_events.append("发现损坏的 journal，已按无在途操作清理")
+            self._gc_orphans()
+            return
+        self._reconcile_journal(journal)
+        self._gc_orphans()
 
     def _load_manifest(self) -> dict | None:
         path = self.root / MANIFEST_NAME
@@ -199,6 +250,9 @@ class Store:
         """校验并整体替换当前存储。新清单原子切换，切换前旧链不受影响。"""
         disk_size, layers = self._validate_import(payload)
         with self._lock:
+            # 上一轮撤除若留下未清理的 journal，先按实际提交状态对账，
+            # 绝不能带着在途日志切换清单，否则重启恢复会无法判定状态。
+            self._reconcile_pending_journal()
             files: dict[str, str] = {}
             try:
                 for lid, layer in layers.items():
@@ -312,6 +366,8 @@ class Store:
     # ------------------------------------------------------------------ #
     def remove(self, layer_id: str) -> dict:
         with self._lock:
+            # 拦截并处理上一轮遗留的在途撤除日志，保证同一时刻只有一个在途操作
+            self._reconcile_pending_journal()
             plan = self._prepare_remove(layer_id)
             try:
                 self._commit_remove(plan)
